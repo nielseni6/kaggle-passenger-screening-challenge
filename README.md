@@ -1,8 +1,8 @@
 This is my submission for the Kaggle Passenger Screening Algorithm Challenge 
 
 Before building the models and obtaining weights, all aps files must be preprocessed.
-To preprocess all of the TSA data, all proper aps files must be in the aps directory.
-Also, the csv files for the training data or test data must be in the current working directory. 
+To preprocess all of the data, all proper aps files must be in the aps directory.
+Also, the csv files for the training data or test data must be in the current directory. 
 
 To preprocess train data run:
 python preprocess.py -train
