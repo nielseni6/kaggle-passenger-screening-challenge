@@ -2,7 +2,7 @@
 # in Kaggles Passenger Screening Algorithm Challenge. My approach involves cropping
 # the aps slices in general regions where the body zone is likely to be
 # and stitching these together in an image plate of front/back
-# /left side/right side 
+# /front side angle/back side angle 
 #
 # All aps files must be in aps directory 
 #
