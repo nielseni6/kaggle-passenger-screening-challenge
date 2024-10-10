@@ -23,61 +23,25 @@ import time
 import os
 import sys
 import re
-import bcolz
 import files as flz
-import math 
+import math
+import pandas as pd
 
 from glob import glob
+import argparse
+# import warnings
 
-plt.ion()   # interactive mode
-DIR_PATH = os.getcwd()
-TEST_PATH = DIR_PATH + '/test/'
-MODEL_PATH = DIR_PATH + '/models/'
-SUB_PATH = DIR_PATH + '/submissions/'
-PRED_PATH = DIR_PATH + '/predictions/'
-tst_fpaths, test_fnames = flz.get_paths_to_files(TEST_PATH)
+# gpu_ok = False
+# if torch.cuda.is_available():
+#     device_cap = torch.cuda.get_device_capability()
+#     if device_cap in ((7, 0), (8, 0), (9, 0)):
+#         gpu_ok = True
 
-# Data augmentation and normalization for training
-# Just normalization for validation
-data_transforms = {
-    'train': transforms.Compose([
-        transforms.RandomSizedCrop(224),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    ]),
-    'val': transforms.Compose([
-        transforms.Scale(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    ]),
-    'test': transforms.Compose([
-        transforms.Scale(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    ])
-}
-
-data_dir = DIR_PATH
-image_datasets = {x: ds.ImageFolder(os.path.join(data_dir, x),
-                                          data_transforms[x])
-                  for x in ['train', 'val']}
-dataloaders = {x: torch.utils.data.DataLoader(image_datasets[x], batch_size=4,
-                                             shuffle=True, num_workers=4)
-              for x in ['train', 'val']}
-
-img_reader='pil'
-
-tst_dataset = ds.ImageFolder(TEST_PATH, data_transforms['test'])
-tst_loader = torch.utils.data.DataLoader(tst_dataset, batch_size=4, shuffle=False,
-                      pin_memory=False, num_workers=4)
-
-dataset_sizes = {x: len(image_datasets[x]) for x in ['train', 'val']}
-class_names = image_datasets['train'].classes
-
-use_gpu = torch.cuda.is_available()
+# if not gpu_ok:
+#     warnings.warn(
+#         "GPU is not NVIDIA V100, A100, or H100. Speedup numbers may be lower "
+#         "than expected."
+#     )
 
 
 # Pytorch transfer learning code source:
@@ -92,6 +56,7 @@ use_gpu = torch.cuda.is_available()
 def train_model(model, criterion, optimizer, scheduler, num_epochs=4):
     since = time.time()
 
+    model = torch.compile(model)
     best_model_wts = model.state_dict()
     best_acc = 0.0
 
@@ -102,7 +67,7 @@ def train_model(model, criterion, optimizer, scheduler, num_epochs=4):
         # Each epoch has a training and validation phase
         for phase in ['train', 'val']:
             if phase == 'train':
-                scheduler.step()
+                # scheduler.step()
                 model.train(True)  # Set model to training mode
             else:
                 model.train(False)  # Set model to evaluate mode
@@ -116,11 +81,13 @@ def train_model(model, criterion, optimizer, scheduler, num_epochs=4):
                 inputs, labels = data
 
                 # wrap them in Variable
-                if use_gpu:
-                    inputs = Variable(inputs.cuda())
-                    labels = Variable(labels.cuda())
-                else:
-                    inputs, labels = Variable(inputs), Variable(labels)
+                inputs = inputs.to(device)
+                labels = labels.to(device)
+                
+                # Add Gaussian noise if robust training is enabled
+                if args.robust and phase == 'train':
+                    noise = torch.normal(mean=0, std=0.1, size=inputs.shape).to(device)
+                    inputs = inputs + noise
 
                 # zero the parameter gradients
                 optimizer.zero_grad()
@@ -134,9 +101,10 @@ def train_model(model, criterion, optimizer, scheduler, num_epochs=4):
                 if phase == 'train':
                     loss.backward()
                     optimizer.step()
+                    scheduler.step()
 
                 # statistics
-                running_loss += loss.data[0]
+                running_loss += loss.data
                 running_corrects += torch.sum(preds == labels.data)
 
             epoch_loss = running_loss / dataset_sizes[phase]
@@ -166,135 +134,185 @@ def train_model(model, criterion, optimizer, scheduler, num_epochs=4):
 # passenger screening data. Saves their weights to model directory. 
 #----------------------------------------------------------------------------------------
 def train_all(): 
-	## TRAIN RESNET 18
-	model_ft = models.resnet18(pretrained=True)
-	num_ftrs = model_ft.fc.in_features
-	model_ft.fc = nn.Linear(num_ftrs, 2)
-	if use_gpu:
-            model_ft = model_ft.cuda()
-	criterion = nn.CrossEntropyLoss()
-	
-	optimizer_ft = optim.SGD(model_ft.parameters(), lr=0.001, momentum=0.9)
+    ## TRAIN RESNET 18
+    model_ft = models.resnet18(pretrained=True)
+    num_ftrs = model_ft.fc.in_features
+    model_ft.fc = nn.Linear(num_ftrs, 2)
+    model_ft = model_ft.to(device)
+    criterion = nn.CrossEntropyLoss()
+    
+    optimizer_ft = optim.SGD(model_ft.parameters(), lr=0.001, momentum=0.9)
 
-	exp_lr_scheduler = lr_scheduler.StepLR(optimizer_ft, step_size=7, gamma=0.1)
+    exp_lr_scheduler = lr_scheduler.StepLR(optimizer_ft, step_size=7, gamma=0.1)
 
-	model_ft = train_model(model_ft, criterion, optimizer_ft, exp_lr_scheduler,
+    model_ft = train_model(model_ft, criterion, optimizer_ft, exp_lr_scheduler,
                        num_epochs=25)
 
-	torch.save(model_ft, MODEL_PATH +'resnet18_t3.pt')
+    robust_suffix = '_robust' if args.robust else ''
 
-	## TRAIN RESNET 34
-	model_ft = models.resnet34(pretrained=True)
-	num_ftrs = model_ft.fc.in_features
-	model_ft.fc = nn.Linear(num_ftrs, 2)
-	if use_gpu:
-            model_ft = model_ft.cuda()
+    torch.save(model_ft, MODEL_PATH + f'resnet18_t3{robust_suffix}.pt')
 
-	criterion = nn.CrossEntropyLoss()
+    ## TRAIN RESNET 34
+    model_ft = models.resnet34(pretrained=True)
+    num_ftrs = model_ft.fc.in_features
+    model_ft.fc = nn.Linear(num_ftrs, 2)
+    model_ft = model_ft.to(device)
 
-	optimizer_ft = optim.SGD(model_ft.parameters(), lr=0.001, momentum=0.9)
+    criterion = nn.CrossEntropyLoss()
 
-	exp_lr_scheduler = lr_scheduler.StepLR(optimizer_ft, step_size=7, gamma=0.1)
-	model_ft = train_model(model_ft, criterion, optimizer_ft, exp_lr_scheduler,
+    optimizer_ft = optim.SGD(model_ft.parameters(), lr=0.001, momentum=0.9)
+
+    exp_lr_scheduler = lr_scheduler.StepLR(optimizer_ft, step_size=7, gamma=0.1)
+    model_ft = train_model(model_ft, criterion, optimizer_ft, exp_lr_scheduler,
                        num_epochs=25)
-	torch.save(model_ft, MODEL_PATH +'resnet34_ft1.pt')
+    torch.save(model_ft, MODEL_PATH + f'resnet34_ft1{robust_suffix}.pt')
 
-	## TRAIN RESNET50
-	model_ft = models.resnet50(pretrained=True)
-	num_ftrs = model_ft.fc.in_features
-	model_ft.fc = nn.Linear(num_ftrs, 2)
-	if use_gpu:
-            model_ft = model_ft.cuda()
-	criterion = nn.CrossEntropyLoss()
+    ## TRAIN RESNET50
+    model_ft = models.resnet50(pretrained=True)
+    num_ftrs = model_ft.fc.in_features
+    model_ft.fc = nn.Linear(num_ftrs, 2)
+    model_ft = model_ft.to(device)
+    criterion = nn.CrossEntropyLoss()
 
-	optimizer_ft = optim.SGD(model_ft.parameters(), lr=0.001, momentum=0.9)
+    optimizer_ft = optim.SGD(model_ft.parameters(), lr=0.001, momentum=0.9)
 
-	exp_lr_scheduler = lr_scheduler.StepLR(optimizer_ft, step_size=20, gamma=0.1)
-	model_ft = train_model(model_ft, criterion, optimizer_ft, exp_lr_scheduler,
-	                       num_epochs=100)
-	torch.save(model_ft, MODEL_PATH +'resnet50_ft1.pt')
+    exp_lr_scheduler = lr_scheduler.StepLR(optimizer_ft, step_size=20, gamma=0.1)
+    model_ft = train_model(model_ft, criterion, optimizer_ft, exp_lr_scheduler,
+                           num_epochs=100)
+    torch.save(model_ft, MODEL_PATH + f'resnet50_ft1{robust_suffix}.pt')
 
-	## TRAIN RESNET 101
-	model_ft = models.resnet101(pretrained=True)
-	num_ftrs = model_ft.fc.in_features
-	model_ft.fc = nn.Linear(num_ftrs, 2)
-	if use_gpu:
-            model_ft = model_ft.cuda()
-	criterion = nn.CrossEntropyLoss()
+    ## TRAIN RESNET 101
+    model_ft = models.resnet101(pretrained=True)
+    num_ftrs = model_ft.fc.in_features
+    model_ft.fc = nn.Linear(num_ftrs, 2)
+    model_ft = model_ft.to(device)
+    criterion = nn.CrossEntropyLoss()
 
-	optimizer_ft = optim.SGD(model_ft.parameters(), lr=0.001, momentum=0.9)
+    optimizer_ft = optim.SGD(model_ft.parameters(), lr=0.001, momentum=0.9)
 
-	exp_lr_scheduler = lr_scheduler.StepLR(optimizer_ft, step_size=20, gamma=0.1)
-	model_ft = train_model(model_ft, criterion, optimizer_ft, exp_lr_scheduler,
+    exp_lr_scheduler = lr_scheduler.StepLR(optimizer_ft, step_size=20, gamma=0.1)
+    model_ft = train_model(model_ft, criterion, optimizer_ft, exp_lr_scheduler,
                        num_epochs=100)
-	torch.save(model_ft, MODEL_PATH +'resnet101_ft1.pt')
+    torch.save(model_ft, MODEL_PATH + f'resnet101_ft1{robust_suffix}.pt')
 
-	## TRAIN RESNET 152
-	model_ft = models.resnet152(pretrained=True)
-	num_ftrs = model_ft.fc.in_features
-	model_ft.fc = nn.Linear(num_ftrs, 2)
-	if use_gpu:
-            model_ft = model_ft.cuda()
-	criterion = nn.CrossEntropyLoss()
+    ## TRAIN RESNET 152
+    model_ft = models.resnet152(pretrained=True)
+    num_ftrs = model_ft.fc.in_features
+    model_ft.fc = nn.Linear(num_ftrs, 2)
+    model_ft = model_ft.to(device)
+    criterion = nn.CrossEntropyLoss()
 
-	optimizer_ft = optim.SGD(model_ft.parameters(), lr=0.001, momentum=0.9)
+    optimizer_ft = optim.SGD(model_ft.parameters(), lr=0.001, momentum=0.9)
 
-	exp_lr_scheduler = lr_scheduler.StepLR(optimizer_ft, step_size=20, gamma=0.1)
-	model_ft = train_model(model_ft, criterion, optimizer_ft, exp_lr_scheduler,
+    exp_lr_scheduler = lr_scheduler.StepLR(optimizer_ft, step_size=20, gamma=0.1)
+    model_ft = train_model(model_ft, criterion, optimizer_ft, exp_lr_scheduler,
                        num_epochs=94)
-	torch.save(model_ft, MODEL_PATH +'resnet152_ft1.pt')
+    torch.save(model_ft, MODEL_PATH + f'resnet152_ft1{robust_suffix}.pt')
 
-	## TRAIN VGG 19
-	model_ft = models.vgg19(pretrained=True)
-	num_ftrs =  model_ft.classifier[6].in_features
-	feature_model = list(model_ft.classifier.children())
-	feature_model.pop()
-	feature_model.append(nn.Linear(num_ftrs, 2))
-	model_ft.classifier = nn.Sequential(*feature_model)
-	print(num_ftrs)
-	if use_gpu:
-	       model_ft = model_ft.cuda()
-	criterion = nn.CrossEntropyLoss()
+    ## TRAIN VGG 19
+    model_ft = models.vgg19(pretrained=True)
+    num_ftrs =  model_ft.classifier[6].in_features
+    feature_model = list(model_ft.classifier.children())
+    feature_model.pop()
+    feature_model.append(nn.Linear(num_ftrs, 2))
+    model_ft.classifier = nn.Sequential(*feature_model)
+    print(num_ftrs)
+    model_ft = model_ft.to(device)
+    criterion = nn.CrossEntropyLoss()
 
-	optimizer_ft = optim.SGD(model_ft.parameters(), lr=0.001, momentum=0.9)
+    optimizer_ft = optim.SGD(model_ft.parameters(), lr=0.001, momentum=0.9)
 
-	exp_lr_scheduler = lr_scheduler.StepLR(optimizer_ft, step_size=10, gamma=0.1)	
-	model_ft = train_model(model_ft, criterion, optimizer_ft, exp_lr_scheduler,
+    exp_lr_scheduler = lr_scheduler.StepLR(optimizer_ft, step_size=10, gamma=0.1)	
+    model_ft = train_model(model_ft, criterion, optimizer_ft, exp_lr_scheduler,
                        num_epochs=50)
-	torch.save(model_ft, MODEL_PATH +'vgg19_ft1.pt')
+    torch.save(model_ft, MODEL_PATH + f'vgg19_ft1{robust_suffix}.pt')
 
-	## TRAIN VGG 16
-	model_ft = models.vgg16(pretrained=True)
-	num_ftrs =  model_ft.classifier[6].in_features
-	feature_model = list(model_ft.classifier.children())
-	feature_model.pop()
-	feature_model.append(nn.Linear(num_ftrs, 2))
-	model_ft.classifier = nn.Sequential(*feature_model)
-	print(num_ftrs)
-	if use_gpu:
-	       model_ft = model_ft.cuda()
-	criterion = nn.CrossEntropyLoss()
+    ## TRAIN VGG 16
+    model_ft = models.vgg16(pretrained=True)
+    num_ftrs =  model_ft.classifier[6].in_features
+    feature_model = list(model_ft.classifier.children())
+    feature_model.pop()
+    feature_model.append(nn.Linear(num_ftrs, 2))
+    model_ft.classifier = nn.Sequential(*feature_model)
+    print(num_ftrs)
+    model_ft = model_ft.to(device)
+    criterion = nn.CrossEntropyLoss()
 
-	optimizer_ft = optim.SGD(model_ft.parameters(), lr=0.001, momentum=0.9)
+    optimizer_ft = optim.SGD(model_ft.parameters(), lr=0.001, momentum=0.9)
 
-	exp_lr_scheduler = lr_scheduler.StepLR(optimizer_ft, step_size=15, gamma=0.1)
-	model_ft = train_model(model_ft, criterion, optimizer_ft, exp_lr_scheduler,
+    exp_lr_scheduler = lr_scheduler.StepLR(optimizer_ft, step_size=15, gamma=0.1)
+    model_ft = train_model(model_ft, criterion, optimizer_ft, exp_lr_scheduler,
                        num_epochs=70)
-	torch.save(model_ft, MODEL_PATH +'vgg16_ft1.pt')
+    torch.save(model_ft, MODEL_PATH + f'vgg16_ft1{robust_suffix}.pt')
 
 
 # Code for generating predictions source: https://github.com/bfortuner/pytorch-kaggle-starter
 # Original Author: Brendan Fortuner
 def predict_batch(net, inputs):
-    v = Variable(inputs.cuda(), volatile=True)
+    v = inputs.to(device)
     return net(v).data.cpu().numpy()
 
 def get_probabilities(model, loader):
     model.eval()
     return np.vstack(predict_batch(model, data[0]) for data in loader)
 
+def smooth_grad(inputs, model, criterion, n_samples=50, stdev_spread=0.05, abs=False):
+    mean = 0
+    stdev = stdev_spread * (torch.max(inputs) - torch.min(inputs)).item()
+    total_gradients = torch.zeros_like(inputs)
+    
+    for _ in range(n_samples):
+        noise = torch.normal(mean, stdev, size=inputs.shape).to(device)
+        noisy_inputs = inputs + noise
+        noisy_inputs.requires_grad_()
+        outputs = model(noisy_inputs)
+        pred_pos = outputs[:, 0]
+        pred_neg = outputs[:, 1]
+        pred = pred_pos - pred_neg
+        # _, preds = torch.max(outputs.data, 1)
+        # loss = criterion(outputs, preds)
+        gradients = torch.autograd.grad(torch.unbind(pred), noisy_inputs)[0]
+        if abs:
+            gradients = torch.abs(gradients)
+        total_gradients += gradients
+    
+    avg_gradients = total_gradients / n_samples
+    return avg_gradients
+    
+def predict_batch_attr(net, inputs, args):
+    criterion = nn.CrossEntropyLoss()
+    v = inputs.to(device).requires_grad_()
+    outputs = net(v)
+    pred_pos = outputs[:, 0]
+    pred_neg = outputs[:, 1]
+    pred = pred_pos - pred_neg
+    # _, preds = torch.max(outputs.data, 1)
+    # loss = criterion(outputs, preds)
+    if args.attr_method == 'vanilla':
+        grad = torch.autograd.grad(torch.unbind(pred), v)[0]
+        if args.abs_attr:
+            grad = torch.abs(grad)
+    elif args.attr_method == 'smoothgrad':
+        grad = smooth_grad(v, net, criterion, abs = args.abs_attr)
+
+    return net(v).data.cpu().numpy(), grad.cpu().numpy()
+
+def get_probabilities_attr(model, loader, args):
+    model.eval()
+    probabilities = []
+    grads = []
+    images = []
+    for data in loader:
+        inputs = data[0]
+        prob, grad = predict_batch_attr(model, inputs, args)
+        probabilities.append(prob)
+        grads.append(grad)
+        images.append(inputs.cpu().numpy())
+
+    return np.vstack(probabilities), np.vstack(grads), np.vstack(images)
+
 def get_prediction_fpath(basename, dset):
-    fname = '{:s}_{:s}'.format(basename, dset + '.bc')
+    fname = '{:s}_{:s}'.format(basename, dset + '.csv')
     return os.path.join(PRED_PATH, fname)
 
 def save_or_append_pred_to_file(fpath, pred_arr, meta_dict=None):
@@ -304,24 +322,26 @@ def save_or_append_pred_to_file(fpath, pred_arr, meta_dict=None):
         return save_pred(fpath, pred_arr, meta_dict)
 
 def save_pred(fpath, pred_arr, meta_dict=None):
-    bc = bcolz.carray(pred_arr, mode='w', rootdir=fpath, 
-            cparams=bcolz.cparams(clevel=9, cname='lz4'))
+    df = pd.DataFrame(pred_arr)
     if meta_dict is not None:
-        bc.attrs['meta'] = meta_dict
-    bc.flush()
-    return bc
+        for key, value in meta_dict.items():
+            df[key] = value
+    df.to_csv(fpath, index=False)
+    return df
 
 def append_pred_to_file(fpath, pred_arr, meta_dict=None):
-    bc_arr = bcolz.open(rootdir=fpath)
-    bc_arr.append(pred_arr)
+    df = pd.read_csv(fpath)
+    new_df = pd.DataFrame(pred_arr)
     if meta_dict is not None:
-        bc_arr.attrs['meta'] = meta_dict
-    bc_arr.flush()
-    return bc_arr
+        for key, value in meta_dict.items():
+            new_df[key] = value
+    df = pd.concat([df, new_df], ignore_index=True)
+    df.to_csv(fpath, index=False)
+    return df
 
 def get_sub_path_from_pred_path(pred_fpath):
     sub_fname = os.path.basename(pred_fpath).rstrip(
-        '.bc') + '.csv'
+        '.csv') + '.csv'
     sub_fpath = os.path.join(SUB_PATH, sub_fname)
     return sub_fpath
 
@@ -369,31 +389,159 @@ def kaggle_bag(glob_files, loc_outfile, method="average", weights="uniform"):
     print("wrote to {}".format(loc_outfile))
 
 
-def ensemble_predictions(): 
-	for filename in os.listdir(MODEL_PATH):
-		model_ft = torch.load(MODEL_PATH+filename)
-		tst_probs = get_probabilities(model_ft, tst_loader)
-		(prefix, sep, suffix) = filename.rpartition('.')
-		filename = 'm_' + prefix 
-		pred_fpath = get_prediction_fpath(basename=filename, dset='_t1')
-		_ = save_or_append_pred_to_file(pred_fpath, tst_probs)
-		ub_fpath = get_sub_path_from_pred_path(pred_fpath)
-		fnames = get_fnames_from_fpaths(tst_fpaths)
-		sub_ids = [f.split('.')[0] for f in fnames]
-		tst_probs = np.clip(tst_probs, .03, .97) 
-		make_preds_submission(sub_fpath, sub_ids, np.expand_dims(tst_probs[:,1],1), 'Id,Probability')
-		
-	glob_files = SUB_PATH + 'm*.csv'
-	loc_outfile = SUB_PATH + 'geomean.csv'
-	kaggle_bag(glob_files, loc_outfile)
+def ensemble_predictions(args): 
+    for filename in os.listdir(MODEL_PATH):
+        if args.robust and ('robust' not in filename):
+            continue
+        model_ft = torch.load(MODEL_PATH + filename)
+        model_ft = torch.compile(model_ft)
+        print('Loaded model: ', filename)
+        if args.attribution:
+            tst_probs, tst_grads, tst_images = get_probabilities_attr(model_ft, tst_loader, args)
+            if args.debug:
+                # Create a directory for each model's attributions
+                model_attr_dir = os.path.join('attributions', filename, args.attr_method + ('_abs' if args.abs_attr else ''))
+                if not os.path.exists(model_attr_dir):
+                    os.makedirs(model_attr_dir)
+                
+                for i in range(40):
+                    fig, ax = plt.subplots(1, 3, figsize=(15, 5))
+                    
+                    # Original image
+                    img = tst_images[i].transpose(1, 2, 0)  # Convert from CHW to HWC
+                    img = (img - img.min()) / (img.max() - img.min())  # Normalize to [0, 1]
+                    ax[0].imshow(img)
+                    ax[0].set_title('Original Image')
+                    ax[0].axis('off')
+                    
+                    # Gradient image
+                    grad_img = tst_grads[i].transpose(1, 2, 0)  # Convert from CHW to HWC
+                    grad_img = (grad_img - grad_img.min()) / (grad_img.max() - grad_img.min())  # Normalize to [0, 1]
+                    ax[1].imshow(grad_img, cmap='jet')
+                    ax[1].set_title('Gradient Image')
+                    ax[1].axis('off')
+                    
+                    # Overlay gradient as heatmap on original image
+                    overlay_img = img.copy()
+                    heatmap = grad_img[..., 0]  # Use the first channel for heatmap
+                    heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min())  # Normalize to [0, 1]
+                    ax[2].imshow(img)
+                    heatmap_img = ax[2].imshow(heatmap, cmap='jet', alpha=0.5)
+                    ax[2].set_title('Overlay Image')
+                    ax[2].axis('off')
+                    
+                    # Add colorbar
+                    cbar = fig.colorbar(heatmap_img, ax=ax[2], orientation='vertical')
+                    cbar.set_label('Gradient Intensity')
+                    
+                    plt.suptitle(f'Model: {filename} - Prediction: {float(sum(tst_probs[i]))}')
+                    
+                    # Determine the folder based on the prediction
+                    if float(sum(tst_probs[i])) > 0:
+                        save_dir = os.path.join(model_attr_dir, 'threat')
+                    else:
+                        save_dir = os.path.join(model_attr_dir, 'nothreat')
+                    
+                    if not os.path.exists(save_dir):
+                        os.makedirs(save_dir)
+                    
+                    plt.savefig(os.path.join(save_dir, f'overlay_{i}.jpg'))
+                    plt.close(fig)
+        else:
+            tst_probs = get_probabilities(model_ft, tst_loader)
+        (prefix, sep, suffix) = filename.rpartition('.')
+        filename = 'm_' + prefix 
+        pred_fpath = get_prediction_fpath(basename=filename, dset='_t1')
+        _ = save_or_append_pred_to_file(pred_fpath, tst_probs)
+        sub_fpath = get_sub_path_from_pred_path(pred_fpath)
+        fnames = get_fnames_from_fpaths(tst_fpaths)
+        if 'README.md' in fnames:
+            fnames.remove('README.md')
+        sub_ids = [f.split('.')[0] for f in fnames]
+        tst_probs = np.clip(tst_probs, .03, .97) 
+        make_preds_submission(sub_fpath, sub_ids, np.expand_dims(tst_probs[:,1],1), 'Id,Probability')
+    glob_files = SUB_PATH + 'm*.csv'
+    loc_outfile = SUB_PATH + 'geomean.csv'
+    kaggle_bag(glob_files, loc_outfile)
 
 
 if __name__ == '__main__':
-	if(sys.argv[1] == "-predict"):
-		ensemble_predictions()
-	elif(sys.argv[1] == "-trainall"): 
-		train_all() 
-	else:
-		print("Rerun this program with '-trainall' or '-predict' to retrain networks or generate predictions")
 
+    # python model_builder.py --predict --attribution --robust --debug --abs_attr --device 1 --attr_method smoothgrad 
+    # python model_builder.py --trainall --robust --device 5
+
+    parser = argparse.ArgumentParser(description='Train models or generate predictions.')
+    parser.add_argument('--trainall', '-trainall', action='store_true', help="Retrain all models")
+    parser.add_argument('--predict', '-predict', action='store_true', help="Generate predictions")
+    parser.add_argument('--attribution', action='store_true', help="Whether to use gradient attribution or not")
+    parser.add_argument('--debug', action='store_true', help="Debug mode")
+    parser.add_argument('--attr_method', choices=['vanilla', 'smoothgrad'], default='vanilla', help="Attribution method: 'vanilla' or 'smoothgrad'")
+    parser.add_argument('--abs_attr', action='store_true', help="Apply absolute value to attribution method")
+    parser.add_argument('--device', type=int, default=3, help="CUDA device number")
+    parser.add_argument('--robust', action='store_true', help="Enable robust training")
+
+    args = parser.parse_args()
+
+    plt.ion()   # interactive mode
+    DIR_PATH = os.getcwd()
+    TEST_PATH = DIR_PATH + '/test/'
+    MODEL_PATH = DIR_PATH + '/models/'
+    SUB_PATH = DIR_PATH + '/submissions/'
+    PRED_PATH = DIR_PATH + '/predictions/'
+    tst_fpaths, test_fnames = flz.get_paths_to_files(TEST_PATH)
+
+    # Data augmentation and normalization for training
+    # Just normalization for validation
+    data_transforms = {
+        'train': transforms.Compose([
+            transforms.RandomResizedCrop(224),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomRotation(10),
+            transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.1),
+            transforms.RandomVerticalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ]),
+        'val': transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ]),
+        'test': transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+    }
+
+    data_dir = DIR_PATH
+    image_datasets = {x: ds.ImageFolder(os.path.join(data_dir, x),
+                                            data_transforms[x])
+                    for x in ['train', 'val']}
+    dataloaders = {x: torch.utils.data.DataLoader(image_datasets[x], batch_size=64,
+                                                shuffle=True, num_workers=8)
+                for x in ['train', 'val']}
+
+    img_reader='pil'
+
+    tst_dataset = ds.ImageFolder(TEST_PATH, data_transforms['test'])
+    tst_loader = torch.utils.data.DataLoader(tst_dataset, batch_size=16, shuffle=False,
+                        pin_memory=False, num_workers=8)
+
+    dataset_sizes = {x: len(image_datasets[x]) for x in ['train', 'val']}
+    class_names = image_datasets['train'].classes
+
+    # Set CUDA device
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID" 
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if args.predict:
+        ensemble_predictions(args)
+    elif args.trainall:
+        train_all()
+    else:
+        print("Invalid mode. Use '--trainall' to retrain networks or '--predict' to generate predictions.")
 

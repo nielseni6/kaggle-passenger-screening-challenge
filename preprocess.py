@@ -32,12 +32,15 @@ import scipy.misc
 import PIL
 from PIL import Image
 from pathlib import Path
+import random
+import shutil
 
-DIR_PATH = os.getcwd()
+DIR_PATH = os.getcwd() # '/data/nielseni6/airport_data'
 TRAIN_PATH = DIR_PATH + '/train/'
 VAL_PATH = DIR_PATH + '/val/'
 TEST_PATH = DIR_PATH + '/test/'
 I_FOLDER = DIR_PATH + '/aps'
+# DIR_PATH_ = os.getcwd()
 TRAIN_LABELS = DIR_PATH + '/stage1_labels.csv'
 TEST_LABELS = DIR_PATH + '/stage1_sample_submission.csv'
  
@@ -516,9 +519,10 @@ def read_data(infile):
 def getDF(infile):
     # pull the labels for a given patient
     df = pd.read_csv(infile)
-
     # Separate the zone and patient id into a df
-    df['Subject'], df['Zone'] = df['Id'].str.split('_Zone',1).str
+    df[['Subject', 'Zone']] = df['Id'].str.split('_Zone', expand=True)
+    # # Separate the zone and patient id into a df
+    # df['Subject'], df['Zone'] = df['Id'].str.split('_Zone', 1).str
     df = df[['Subject', 'Zone', 'Probability']]
     
     return df
@@ -592,7 +596,7 @@ def convert_to_grayscale(img):
 #-------------------------------------------------------------------------------
 
 def spread_spectrum(img):
-    img = stats.threshold(img, threshmin=12, newval=0)
+    img = np.where(img < 12, 0, img)
     
     # see http://docs.opencv.org/3.1.0/d5/daf/tutorial_py_histogram_equalization.html
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
@@ -702,11 +706,11 @@ def preprocess_tsa_data(LABELS=TEST_LABELS):
                        
                 # get probability label if from training labels
                 if(LABELS == TRAIN_LABELS): 
-	                df = getDF(LABELS)
-	                df = df.where(df['Subject']== subject)
-	                df = df.where(df['Zone'] == zone_Num_String)
-	                df.to_string(index=False) 
-	                p = df[df.Zone == zone_Num_String].Probability.item()
+                    df = getDF(LABELS)
+                    df = df.where(df['Subject']== subject)
+                    df = df.where(df['Zone'] == zone_Num_String)
+                    df.to_string(index=False) 
+                    p = df[df.Zone == zone_Num_String].Probability.item()
 
                 count = 0
                 array_of_files= []
@@ -749,23 +753,26 @@ def preprocess_tsa_data(LABELS=TEST_LABELS):
                         
                         # create descriptive file name
                         if(LABELS == TEST_LABELS):
-                        	#the test file names do not have any description of the threat probability
-                        	file_name = subject + '_Zone' + zone_Num_String + '_' + 'Img'+ str(img_num)+".jpg"
+                            #the test file names do not have any description of the threat probability
+                            file_name = subject + '_Zone' + zone_Num_String + '_' + 'Img'+ str(img_num)+".jpg"
                         else: 
-                        	#the training file names include info about the threat probability
-                        	file_name = subject + '_Zone' + zone_Num_String + '_' + 'Img'+ str(img_num) +  '_' + str(p) +".jpg"
+                            #the training file names include info about the threat probability
+                            file_name = subject + '_Zone' + zone_Num_String + '_' + 'Img'+ str(img_num) +  '_' + str(p) +".jpg"
                         
                         im = Image.fromarray(normalized_img*255)
                         im = im.convert('RGB')
 
                         # determine correct path for image
                         if(LABELS == TEST_LABELS):
-                        	file_path = TEST_PATH + file_name
+                            file_path = TEST_PATH + file_name
                         elif(str(p)== '0.0'): 
                             file_path = TRAIN_PATH + "nothreats/" + file_name
                         else:
                             file_path = TRAIN_PATH + "threats/" + file_name
 
+                        # Create the directory if it does not exist
+                        if not os.path.exists(os.path.dirname(file_path)):
+                          os.makedirs(os.path.dirname(file_path), exist_ok=True)
                         im.save(file_path, "JPEG")
                             
                         count = count + 1
@@ -775,7 +782,7 @@ def preprocess_tsa_data(LABELS=TEST_LABELS):
                 for index, file in enumerate(array_of_files):
                     path = os.path.expanduser(file)
                     img = Image.open(path)
-                    img.thumbnail((111, 111), Image.ANTIALIAS)
+                    img.thumbnail((111, 111), Image.LANCZOS)
                     x = index // 2* 111
                     y = index % 2 * 111
                     w, h = img.size
@@ -786,14 +793,14 @@ def preprocess_tsa_data(LABELS=TEST_LABELS):
                 
                 
                 if(LABELS== TEST_LABELS):
-                	file_name = subject + '_Zone' + zone_Num_String +".jpg"
-                	file_path = TEST_PATH + file_name   
+                    file_name = subject + '_Zone' + zone_Num_String +".jpg"
+                    file_path = TEST_PATH + file_name   
                 elif(str(p)== '0.0'):
-                	file_name = subject + '_Zone' + zone_Num_String + '_' + 'Img_Comb' +  '_' + str(p) +".jpg"
-                	file_path = TRAIN_PATH + "nothreats/" + file_name
+                    file_name = subject + '_Zone' + zone_Num_String + '_' + 'Img_Comb' +  '_' + str(p) +".jpg"
+                    file_path = TRAIN_PATH + "nothreats/" + file_name
                 else:
-                	file_name = subject + '_Zone' + zone_Num_String + '_' + 'Img_Comb' +  '_' + str(p) +".jpg"
-                	file_path = TRAIN_PATH + "threats/" + file_name
+                    file_name = subject + '_Zone' + zone_Num_String + '_' + 'Img_Comb' +  '_' + str(p) +".jpg"
+                    file_path = TRAIN_PATH + "threats/" + file_name
                 result.save(os.path.expanduser(file_path))
 # ---------------------------------------
 
@@ -803,19 +810,27 @@ def preprocess_tsa_data(LABELS=TEST_LABELS):
 # directories and moves them to the val/threats and val/notreats directories
 #---------------------------------------------------------------------------------------
 def split_train_data():
-	# move no threats 
-	path = TRAIN_PATH + 'nothreats/'
-	os.chdir(path)
-	#%cd /home/rg0407581/courses/deeplearning1/data/tsa/preprocessed_4/train/nothreats
-	g = glob('*.jpg')
-	shuf = np.random.permutation(g)
-	for i in range(5000): os.rename(shuf[i], VAL_PATH +'nothreats/' + shuf[i])
-	# MOVE threats
-	path = TRAIN_PATH + 'threats/'
-	os.chdir(path)
-	g = glob('*.jpg')
-	shuf = np.random.permutation(g)
-	for i in range(550): os.rename(shuf[i], VAL_PATH +'threats/' + shuf[i])
+  # Ensure the validation directories exist
+  if not os.path.exists(VAL_PATH + 'nothreats/'):
+    os.makedirs(VAL_PATH + 'nothreats/')
+  if not os.path.exists(VAL_PATH + 'threats/'):
+    os.makedirs(VAL_PATH + 'threats/')
+
+  # Move no threats 
+  path = TRAIN_PATH + 'nothreats/'
+  os.chdir(path)
+  g = glob('*.jpg')  # List all jpg files in the nothreats folder
+  shuf = random.sample(g, len(g))  # Randomly rearrange the list g
+  for i in range(5000): 
+    shutil.move(shuf[i], VAL_PATH + 'nothreats/' + shuf[i])
+
+  # Move threats
+  path = TRAIN_PATH + 'threats/'
+  os.chdir(path)
+  g = glob('*.jpg')  # List all jpg files in the threats folder
+  shuf = random.sample(g, len(g))  # Randomly rearrange the list g
+  for i in range(550): 
+    shutil.move(shuf[i], VAL_PATH + 'threats/' + shuf[i])
 
 
 if __name__ == '__main__':

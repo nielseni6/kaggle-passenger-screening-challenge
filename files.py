@@ -12,8 +12,7 @@ import json
 from contextlib import closing
 from zipfile import ZipFile, ZIP_DEFLATED
 import re
-import bcolz
-
+import numpy as np
 
 
 def get_fnames_from_fpaths(fpaths):
@@ -105,15 +104,13 @@ def save_obj(obj, out_fpath):
 def load_obj(fpath):
     return pickle.load(open(fpath, 'rb'))
 
+# def save_bcolz_array(fpath, arr):
+def save_numpy_array(fpath, arr):
+    np.save(fpath, arr)
 
-def save_bcolz_array(fpath, arr):
-    c=bcolz.carray(arr, rootdir=fpath, mode='w')
-    c.flush()
-
-
-def load_bcolz_array(fpath):
-    return bcolz.open(fpath)[:]
-
+# def load_bcolz_array(fpath):
+def load_numpy_array(fpath):
+    return np.load(fpath)
 
 def compress_file(fpath):
     gzip_fpath = fpath+'.gz'
